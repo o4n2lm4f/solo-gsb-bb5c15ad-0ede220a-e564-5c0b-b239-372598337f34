@@ -8,7 +8,12 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import db, store
-from .models import MergeCreate, ResolveRequest, RuleResolveRequest
+from .models import (
+    DraftResolutionsRequest,
+    MergeCreate,
+    ResolveRequest,
+    RuleResolveRequest,
+)
 from .validation import InvalidResultSchema, ResultValidationFailed
 
 
@@ -90,6 +95,39 @@ async def rule_apply_failed_handler(request: Request, exc: store.RuleApplication
             "detail": str(exc),
             "pointer": exc.pointer,
             "reason": exc.reason,
+        },
+    )
+
+
+@app.exception_handler(store.DraftNotFound)
+async def draft_not_found_handler(request: Request, exc: store.DraftNotFound):
+    return JSONResponse(status_code=404, content={"detail": "draft not found"})
+
+
+@app.exception_handler(store.DraftAlreadyCommitted)
+async def draft_committed_handler(request: Request, exc: store.DraftAlreadyCommitted):
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": (
+                "draft already committed: it can no longer be "
+                "edited, previewed or committed"
+            )
+        },
+    )
+
+
+@app.exception_handler(store.DraftConflictNotOpen)
+async def draft_conflict_not_open_handler(
+    request: Request, exc: store.DraftConflictNotOpen
+):
+    # Re-validated at commit time: a draft pointer no longer names an open
+    # conflict of the merge order.
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "open conflicts changed since the draft was created",
+            "pointer": exc.pointer,
         },
     )
 
@@ -215,3 +253,53 @@ def resolve_by_rules(merge_id: str, body: RuleResolveRequest):
         {"left": rule.left, "right": rule.right} for rule in body.rules
     ]
     return store.apply_rule_resolutions(merge_id, body.revision, rule_items)
+
+
+@app.post("/merges/{merge_id}/drafts", status_code=201)
+def create_draft(merge_id: str):
+    """Open a persistent resolution draft on a pending merge order.
+
+    The draft pins the merge's current revision and snapshots the working
+    document and conflict list. 409 once the merge is resolved, 404 if the
+    merge is unknown.
+    """
+    return store.create_draft(merge_id)
+
+
+@app.put("/merges/{merge_id}/drafts/{draft_id}/resolutions")
+def update_draft_resolutions(
+    merge_id: str, draft_id: str, body: DraftResolutionsRequest
+):
+    """Add or overwrite conflict values in a draft.
+
+    Same choice/value item semantics as a committing batch. Each item
+    upserts the draft's stored resolution for its pointer, so pointers can
+    be filled in over multiple batches. Only the draft is written — the
+    merge order's revision, document and conflicts are untouched.
+    """
+    return store.update_draft_resolutions(
+        merge_id, draft_id, _resolution_items(body)
+    )
+
+
+@app.post("/merges/{merge_id}/drafts/{draft_id}/preview")
+def preview_draft(merge_id: str, draft_id: str):
+    """Dry-run a draft on its pinned snapshot; nothing is persisted.
+
+    Returns the would-be document and the remaining conflicts; when the
+    draft covers every conflict, the deterministic base-to-result patch
+    and its SHA-256 are included.
+    """
+    return store.preview_draft(merge_id, draft_id)
+
+
+@app.post("/merges/{merge_id}/drafts/{draft_id}/commit")
+def commit_draft(merge_id: str, draft_id: str):
+    """Commit a draft onto its merge order in a single transaction.
+
+    Re-validates the pinned revision, the open conflicts and the
+    result_schema gate, then applies every stored value at once (one
+    revision bump) and spends the draft. Any changed condition yields 409
+    (a failing schema gate yields 422) with nothing partially written.
+    """
+    return store.commit_draft(merge_id, draft_id)

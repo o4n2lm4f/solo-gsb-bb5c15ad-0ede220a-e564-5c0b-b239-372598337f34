@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
+from typing import Iterator
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "./merges.db")
 
@@ -27,6 +29,22 @@ CREATE TABLE IF NOT EXISTS merges (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+
+-- Persistent resolution drafts for pending merge orders. A draft pins the
+-- merge revision at creation time and snapshots the working document and
+-- conflict list; its resolutions map (pointer -> {choice} or {value}) is
+-- edited independently of the merge order and committed atomically.
+CREATE TABLE IF NOT EXISTS merge_drafts (
+    id              TEXT PRIMARY KEY,
+    merge_id        TEXT NOT NULL REFERENCES merges (id),
+    status          TEXT NOT NULL CHECK (status IN ('open', 'committed')),
+    pinned_revision INTEGER NOT NULL,
+    document        TEXT NOT NULL,
+    conflicts       TEXT NOT NULL,
+    resolutions     TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
 """
 
 
@@ -42,8 +60,9 @@ def connect() -> sqlite3.Connection:
     return _conn
 
 
-# Columns added after the initial release; applied to database files that
-# predate them so an existing Docker volume keeps working.
+# Columns/tables added after the initial release; applied to database files
+# that predate them so an existing Docker volume keeps working. New tables
+# (merge_drafts) ride along via CREATE TABLE IF NOT EXISTS in SCHEMA above.
 _MIGRATIONS = (
     "ALTER TABLE merges ADD COLUMN result_schema TEXT",
 )
@@ -66,6 +85,25 @@ def execute(query: str, params: tuple = ()) -> sqlite3.Cursor:
         cur = connect().execute(query, params)
         connect().commit()
         return cur
+
+
+@contextmanager
+def transaction() -> Iterator[sqlite3.Connection]:
+    """Run a check-then-write sequence as one atomic transaction.
+
+    The global lock is held for the whole block and every statement runs on
+    the shared connection: on success all writes commit together, on any
+    exception they roll back together, so no partial state is ever visible.
+    """
+    with _lock:
+        conn = connect()
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
 
 
 def query_one(query: str, params: tuple = ()) -> sqlite3.Row | None:

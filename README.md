@@ -45,6 +45,10 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 | `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值（最后一批须通过 schema 门禁） |
 | `POST` | `/merges/{merge_id}/resolution-preview` | 预演冲突解决：内存副本上校验并应用，不落库、不改状态 |
 | `POST` | `/merges/{merge_id}/rule-resolutions` | 携带 revision 与有序路径规则，按模式批量裁决冲突（最后一批须通过门禁） |
+| `POST` | `/merges/{merge_id}/drafts` | 创建持久化解决草案：固定当前 revision 并快照文档与冲突 |
+| `PUT` | `/merges/{merge_id}/drafts/{draft_id}/resolutions` | 向草案追加或覆盖冲突取值（只写草案，不动合并单） |
+| `POST` | `/merges/{merge_id}/drafts/{draft_id}/preview` | 预演草案：在快照上应用已存取值，返回剩余冲突 |
+| `POST` | `/merges/{merge_id}/drafts/{draft_id}/commit` | 提交草案：单事务重校验并一次性应用全部取值，草案随即失效 |
 | `GET` | `/merges/{merge_id}/patch` | resolved 后：base → result 的 RFC 6902 补丁（含 SHA-256） |
 | `GET` | `/health` | 健康检查 |
 
@@ -279,7 +283,49 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/ru
 - **一条都没命中**时不写入、不递增 revision（响应中 `applied: false`）；这不算错误，返回 `200`。
 - **revision 过期 → `409`**（响应体携带 `current_revision`）；合并单已 `resolved` 后同样 `409`；合并单不存在 → `404`。
 
-### 6. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
+### 6. 持久化解决草案 — `/merges/{merge_id}/drafts`
+
+`pending` 合并单可创建**持久化解决草案**：草案固定创建时的 merge `revision` 并快照当时的工作文档与冲突列表，之后把冲突取值分批暂存在服务端，随时预演，最后一次性提交。适合跨请求、跨会话逐步补齐取值的场景；一个合并单可同时存在多个草案，互不影响。
+
+```bash
+# 1) 创建草案（201）：固定当前 revision、快照文档与冲突
+curl -s -X POST http://localhost:8000/merges/bc6d…/drafts
+```
+
+```json
+{
+  "draft_id": "7d4e…",
+  "merge_id": "bc6d…",
+  "status": "open",
+  "pinned_revision": 1,
+  "resolutions": {},
+  "remaining_conflicts": [
+    {"pointer": "/db/host", "base": "a", "left": "b", "right": "c", "missing": []}
+  ],
+  "created_at": "...", "updated_at": "..."
+}
+```
+
+```bash
+# 2) 追加 / 覆盖取值（可分批多次调用；只写草案，不动合并单）
+curl -s -X PUT http://localhost:8000/merges/bc6d…/drafts/7d4e…/resolutions \
+  -H 'Content-Type: application/json' \
+  -d '{"resolutions": [{"pointer": "/db/host", "choice": "left"}]}'
+
+# 3) 预演：在草案快照上应用已存取值，返回剩余冲突
+curl -s -X POST http://localhost:8000/merges/bc6d…/drafts/7d4e…/preview
+
+# 4) 提交：单事务重校验并一次性应用全部取值，草案随即失效
+curl -s -X POST http://localhost:8000/merges/bc6d…/drafts/7d4e…/commit
+```
+
+- **创建**：仅 `pending` 合并单可创建；已 `resolved` → `409`；合并单不存在 → `404`。
+- **编辑（`PUT .../resolutions`）**：条目语义与正式提交完全一致（`choice` / `value` 二选一，显式 `null` 算 `value`），按指针 **upsert**——新指针追加、已有指针覆盖，可分批补齐。整批先校验后写入：指针不在创建时的冲突集合 → `400`；同一条目同时给 `choice` 与 `value` 或都不给 → `400`；失败批不部分写入。编辑只更新草案行，合并单的 `revision` / `document` / `conflicts` 完全不变。
+- **预演（`POST .../preview`）**：纯只读。在创建时快照上应用草案当前全部取值，返回 `document`、`remaining_conflicts`、`would_resolve`；取值覆盖全部冲突时附确定性 `patch` 与 `result_sha256`（规则同 `resolution-preview`）。不写任何状态。
+- **提交（`POST .../commit`）**：在**单个事务**内重新校验——合并单仍 `pending`（否则 `409`）、当前 `revision` 仍等于 `pinned_revision`（否则 `409`，响应携带 `current_revision`）、草案每个指针仍是开放冲突（否则 `409`）、草案解决了最后一个冲突时候选最终结果须通过 `result_schema` 门禁（否则 `422`，错误格式同前）。全部通过才一次性应用全部取值（`revision` 恰好 +1）并将草案置为 `committed`；任一条件不满足则整体回滚——**合并单与草案内容均不部分写入**，草案保持 `open` 可修正后重试（revision 已变化时需新建草案）。空草案（无任何取值）提交 → `400`。
+- 已 `committed` 的草案再编辑 / 预演 / 提交 → `409`；草案不存在或属于其他合并单 → `404`。
+
+### 7. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
 
 合并单 `resolved` 后，可获取从**原始 `base_doc` 到最终 `result`** 的确定性操作序列（[RFC 6902 JSON Patch](https://www.rfc-editor.org/rfc/rfc6902)，路径为 [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901)）：
 
@@ -329,7 +375,7 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/patch
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（87 项）
+python -m pytest tests/ -q                  # 运行测试（101 项）
 ```
 
 ## 项目结构
@@ -341,10 +387,10 @@ app/
   rules.py      # RFC 6901 风格路径模式（* 与 **）：规则编译、匹配、批量裁决
   patch.py      # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
   validation.py # Draft 2020-12 结果门禁：元 schema 校验 + 最终结果校验（422 错误排序）
-  store.py      # 合并单状态机：revision 校验、冲突解决、不可变结果、schema 门禁
-  db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移）
-  models.py     # Pydantic 请求模型（含可选 result_schema）
-tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁测试）
+  store.py      # 合并单状态机与解决草案：revision 校验、冲突解决、不可变结果、schema 门禁、草案单事务提交
+  db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移与 merge_drafts 表）、原子事务助手
+  models.py     # Pydantic 请求模型（含可选 result_schema 与草案编辑请求）
+tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁与解决草案测试）
 Dockerfile
 docker-compose.yml
 requirements.txt

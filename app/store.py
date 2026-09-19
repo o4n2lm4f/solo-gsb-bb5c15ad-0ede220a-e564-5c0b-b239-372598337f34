@@ -367,3 +367,275 @@ def apply_rule_resolutions(
     view["unmatched_conflicts"] = unmatched
     view["applied"] = True
     return view
+
+
+# ---------------------------------------------------------------------------
+# Persistent resolution drafts
+# ---------------------------------------------------------------------------
+
+DRAFT_OPEN = "open"
+DRAFT_COMMITTED = "committed"
+
+
+class DraftNotFound(Exception):
+    pass
+
+
+class DraftAlreadyCommitted(Exception):
+    """A committed draft is spent: it rejects any further use."""
+
+
+class DraftConflictNotOpen(Exception):
+    """At commit time a draft pointer no longer names an open conflict."""
+
+    def __init__(self, pointer: str):
+        self.pointer = pointer
+        super().__init__(f"no open conflict at pointer {pointer!r}")
+
+
+def _load_merge_row(merge_id: str):
+    row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
+    if row is None:
+        raise MergeNotFound(merge_id)
+    return row
+
+
+def _load_draft_row(merge_id: str, draft_id: str):
+    row = db.query_one("SELECT * FROM merge_drafts WHERE id = ?", (draft_id,))
+    if row is None or row["merge_id"] != merge_id:
+        # A draft is only visible through its own merge order.
+        raise DraftNotFound(draft_id)
+    return row
+
+
+def _draft_view(row) -> dict:
+    resolutions = json.loads(row["resolutions"])
+    conflicts = json.loads(row["conflicts"])
+    return {
+        "draft_id": row["id"],
+        "merge_id": row["merge_id"],
+        "status": row["status"],
+        "pinned_revision": row["pinned_revision"],
+        "resolutions": resolutions,
+        "remaining_conflicts": [
+            c for c in conflicts if c["pointer"] not in resolutions
+        ],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _stored_resolution_items(resolutions: dict) -> list[dict]:
+    """Convert the draft's stored pointer -> choice/value map into batch items."""
+    items = []
+    for pointer, stored in resolutions.items():
+        if "choice" in stored:
+            items.append(
+                {
+                    "pointer": pointer,
+                    "choice": stored["choice"],
+                    "value": None,
+                    "value_provided": False,
+                }
+            )
+        else:
+            items.append(
+                {
+                    "pointer": pointer,
+                    "choice": None,
+                    "value": stored["value"],
+                    "value_provided": True,
+                }
+            )
+    return items
+
+
+def create_draft(merge_id: str) -> dict:
+    """Open a persistent resolution draft on a pending merge order.
+
+    The draft pins the merge's current revision and snapshots the working
+    document and conflict list; later edits only touch the draft, never the
+    merge order.
+    """
+    row = _load_merge_row(merge_id)
+    if row["status"] == STATUS_RESOLVED:
+        raise AlreadyResolved(merge_id)
+    draft_id = uuid.uuid4().hex
+    now = _now()
+    db.execute(
+        """
+        INSERT INTO merge_drafts (
+            id, merge_id, status, pinned_revision,
+            document, conflicts, resolutions, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            draft_id,
+            merge_id,
+            DRAFT_OPEN,
+            row["revision"],
+            row["document"],
+            row["conflicts"],
+            "{}",
+            now,
+            now,
+        ),
+    )
+    return _draft_view(_load_draft_row(merge_id, draft_id))
+
+
+def update_draft_resolutions(
+    merge_id: str, draft_id: str, items: list[dict]
+) -> dict:
+    """Add or overwrite conflict values in a draft.
+
+    Each item upserts the draft's stored resolution for its pointer, so
+    pointers can be filled in over multiple batches. The merge order is
+    never modified. The whole batch is validated against the draft's
+    pinned conflict set before anything is written: a rejected batch
+    leaves the draft untouched.
+    """
+    _load_merge_row(merge_id)
+    row = _load_draft_row(merge_id, draft_id)
+    if row["status"] != DRAFT_OPEN:
+        raise DraftAlreadyCommitted(draft_id)
+
+    open_pointers = {c["pointer"] for c in json.loads(row["conflicts"])}
+    resolutions = json.loads(row["resolutions"])
+    for item in items:
+        pointer = item["pointer"]
+        if pointer not in open_pointers:
+            raise UnknownConflictPointer(pointer)
+        choice = item.get("choice")
+        value_provided = item.get("value_provided")
+        if choice is not None and value_provided:
+            raise InvalidResolution(
+                f"resolution for {pointer!r} gives both 'choice' and 'value'"
+            )
+        if choice is None and not value_provided:
+            raise InvalidResolution(
+                f"resolution for {pointer!r} needs 'choice' or 'value'"
+            )
+        # Upsert: a repeated pointer overwrites the previous draft entry.
+        resolutions[pointer] = (
+            {"choice": choice} if choice is not None else {"value": item["value"]}
+        )
+    db.execute(
+        "UPDATE merge_drafts SET resolutions = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(resolutions), _now(), draft_id),
+    )
+    return _draft_view(_load_draft_row(merge_id, draft_id))
+
+
+def preview_draft(merge_id: str, draft_id: str) -> dict:
+    """Dry-run a draft on its pinned snapshot; nothing is persisted.
+
+    Applies the draft's stored resolutions to the snapshotted working
+    document and reports the would-be document plus the remaining
+    conflicts. When the draft covers every conflict, the deterministic
+    base-to-result patch and its SHA-256 are included (same rules as the
+    resolution-preview endpoint).
+    """
+    merge_row = _load_merge_row(merge_id)
+    row = _load_draft_row(merge_id, draft_id)
+    if row["status"] != DRAFT_OPEN:
+        raise DraftAlreadyCommitted(draft_id)
+
+    document, remaining = _apply_batch(
+        json.loads(row["document"]),
+        json.loads(row["conflicts"]),
+        _stored_resolution_items(json.loads(row["resolutions"])),
+    )
+    would_resolve = not remaining
+    preview = {
+        "draft_id": draft_id,
+        "merge_id": merge_id,
+        "pinned_revision": row["pinned_revision"],
+        "document": document,
+        "remaining_conflicts": remaining,
+        "would_resolve": would_resolve,
+    }
+    if would_resolve:
+        base = json.loads(merge_row["base_doc"])
+        preview["patch"] = generate_patch(base, document)
+        preview["result_sha256"] = sha256_hex(document)
+    return preview
+
+
+def commit_draft(merge_id: str, draft_id: str) -> dict:
+    """Commit a draft: apply all stored values to the merge order atomically.
+
+    Inside a single transaction the merge order is re-fetched and every
+    condition is re-validated: the merge must still be pending, its
+    revision must still equal the pinned one, every draft pointer must
+    still name an open conflict and, when the draft resolves the last
+    conflict, the candidate result must satisfy the merge's result_schema.
+    Only then are all values applied at once (exactly one revision bump)
+    and the draft marked committed. Any failure rolls the transaction
+    back: neither the merge order nor the draft content is partially
+    written, and the draft stays open for a corrected retry.
+    """
+    with db.transaction() as conn:
+        merge_row = conn.execute(
+            "SELECT * FROM merges WHERE id = ?", (merge_id,)
+        ).fetchone()
+        if merge_row is None:
+            raise MergeNotFound(merge_id)
+        draft_row = conn.execute(
+            "SELECT * FROM merge_drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        if draft_row is None or draft_row["merge_id"] != merge_id:
+            raise DraftNotFound(draft_id)
+        if draft_row["status"] != DRAFT_OPEN:
+            raise DraftAlreadyCommitted(draft_id)
+        if merge_row["status"] == STATUS_RESOLVED:
+            raise AlreadyResolved(merge_id)
+        if merge_row["revision"] != draft_row["pinned_revision"]:
+            raise StaleRevision(merge_row["revision"])
+
+        resolutions = json.loads(draft_row["resolutions"])
+        if not resolutions:
+            raise InvalidResolution("draft has no resolutions to commit")
+        conflicts = json.loads(merge_row["conflicts"])
+        open_pointers = {c["pointer"] for c in conflicts}
+        for pointer in resolutions:
+            if pointer not in open_pointers:
+                raise DraftConflictNotOpen(pointer)
+
+        document, remaining = _apply_batch(
+            json.loads(merge_row["document"]),
+            conflicts,
+            _stored_resolution_items(resolutions),
+        )
+        resolved = not remaining
+        # Same gate as explicit resolutions: only the batch resolving the
+        # last conflict is checked against the final-result schema.
+        if resolved and merge_row["result_schema"] is not None:
+            validate_result(json.loads(merge_row["result_schema"]), document)
+
+        now = _now()
+        conn.execute(
+            """
+            UPDATE merges
+            SET status = ?, revision = revision + 1, document = ?,
+                conflicts = ?, result = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                STATUS_RESOLVED if resolved else STATUS_PENDING,
+                json.dumps(document),
+                json.dumps(remaining),
+                # Once written the result is never updated again: immutable.
+                json.dumps(document) if resolved else None,
+                now,
+                merge_id,
+            ),
+        )
+        # The draft is single-use: a successful commit spends it.
+        conn.execute(
+            "UPDATE merge_drafts SET status = ?, updated_at = ? WHERE id = ?",
+            (DRAFT_COMMITTED, now, draft_id),
+        )
+    view = get_merge(merge_id)
+    view["draft_id"] = draft_id
+    return view
