@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "./merges.db")
 
@@ -27,6 +28,18 @@ CREATE TABLE IF NOT EXISTS merges (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS merge_drafts (
+    id              TEXT PRIMARY KEY,
+    merge_id        TEXT NOT NULL REFERENCES merges (id),
+    status          TEXT NOT NULL CHECK (status IN ('open', 'committed')),
+    base_revision   INTEGER NOT NULL,
+    document        TEXT NOT NULL,
+    conflicts       TEXT NOT NULL,
+    resolutions     TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
 """
 
 
@@ -42,8 +55,10 @@ def connect() -> sqlite3.Connection:
     return _conn
 
 
-# Columns added after the initial release; applied to database files that
-# predate them so an existing Docker volume keeps working.
+# Objects created after the initial release; applied to database files that
+# predate them so an existing Docker volume keeps working. The merge_drafts
+# table is part of SCHEMA above (CREATE TABLE IF NOT EXISTS runs on every
+# startup); only column-level changes need an ALTER here.
 _MIGRATIONS = (
     "ALTER TABLE merges ADD COLUMN result_schema TEXT",
 )
@@ -66,6 +81,25 @@ def execute(query: str, params: tuple = ()) -> sqlite3.Cursor:
         cur = connect().execute(query, params)
         connect().commit()
         return cur
+
+
+@contextmanager
+def transaction():
+    """Run a read/check/write sequence as one atomic transaction.
+
+    The global lock is held for the whole block, so rows read inside cannot
+    change underneath the caller; any exception rolls everything back and
+    nothing is partially written.
+    """
+    with _lock:
+        conn = connect()
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
 
 
 def query_one(query: str, params: tuple = ()) -> sqlite3.Row | None:

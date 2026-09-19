@@ -8,7 +8,12 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import db, store
-from .models import MergeCreate, ResolveRequest, RuleResolveRequest
+from .models import (
+    DraftUpdateRequest,
+    MergeCreate,
+    ResolveRequest,
+    RuleResolveRequest,
+)
 from .validation import InvalidResultSchema, ResultValidationFailed
 
 
@@ -75,6 +80,34 @@ async def invalid_resolution_handler(request: Request, exc: store.InvalidResolut
 @app.exception_handler(store.InvalidPattern)
 async def invalid_pattern_handler(request: Request, exc: store.InvalidPattern):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(store.DraftNotFound)
+async def draft_not_found_handler(request: Request, exc: store.DraftNotFound):
+    return JSONResponse(status_code=404, content={"detail": "draft not found"})
+
+
+@app.exception_handler(store.DraftNotOpen)
+async def draft_not_open_handler(request: Request, exc: store.DraftNotOpen):
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "draft is no longer open: it was already committed or invalidated"
+        },
+    )
+
+
+@app.exception_handler(store.DraftConflictSetChanged)
+async def draft_conflicts_changed_handler(
+    request: Request, exc: store.DraftConflictSetChanged
+):
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "draft is stale: the merge's open conflicts no longer "
+            "cover the draft's pointers"
+        },
+    )
 
 
 @app.exception_handler(store.InvalidRuleSet)
@@ -162,7 +195,7 @@ def get_merge_patch(merge_id: str):
     return store.get_merge_patch(merge_id)
 
 
-def _resolution_items(body: ResolveRequest) -> list[dict]:
+def _resolution_items(body: ResolveRequest | DraftUpdateRequest) -> list[dict]:
     return [
         {
             "pointer": r.pointer,
@@ -215,3 +248,66 @@ def resolve_by_rules(merge_id: str, body: RuleResolveRequest):
         {"left": rule.left, "right": rule.right} for rule in body.rules
     ]
     return store.apply_rule_resolutions(merge_id, body.revision, rule_items)
+
+
+# ---------------------------------------------------------------------------
+# Resolution drafts
+# ---------------------------------------------------------------------------
+
+
+@app.post("/merges/{merge_id}/drafts", status_code=201)
+def create_draft(merge_id: str):
+    """Open a persistent resolution draft for a pending merge.
+
+    The draft pins the merge revision at creation time and snapshots the
+    working document and open conflicts, so edits and previews stay stable
+    while other clients keep working on the merge. A resolved merge yields
+    409, an unknown one 404.
+    """
+    return store.create_draft(merge_id)
+
+
+@app.get("/merges/{merge_id}/drafts/{draft_id}")
+def get_draft(merge_id: str, draft_id: str):
+    """Read a draft: status, pinned base_revision and accumulated values."""
+    return store.get_draft(merge_id, draft_id)
+
+
+@app.post("/merges/{merge_id}/drafts/{draft_id}/resolutions")
+def update_draft(merge_id: str, draft_id: str, body: DraftUpdateRequest):
+    """Append or overwrite conflict values on the draft.
+
+    Same choice/value semantics as the resolution endpoints; a pointer
+    already present is overwritten, a new one is appended, and pointers
+    may be filled in over several calls. Only the draft is written — the
+    merge order (revision, conflicts, document) is never touched. A draft
+    that was already committed yields 409.
+    """
+    return store.update_draft(merge_id, draft_id, _resolution_items(body))
+
+
+@app.get("/merges/{merge_id}/drafts/{draft_id}/preview")
+def preview_draft(merge_id: str, draft_id: str):
+    """Dry-run the draft against its creation-time snapshot.
+
+    Nothing is written. Returns the would-be document and the conflicts
+    still open after the draft; when the draft would resolve everything,
+    the deterministic base-to-result patch and its SHA-256 are included.
+    """
+    return store.preview_draft(merge_id, draft_id)
+
+
+@app.post("/merges/{merge_id}/drafts/{draft_id}/commit")
+def commit_draft(merge_id: str, draft_id: str):
+    """Commit the draft: apply all of its values in a single transaction.
+
+    The transaction re-reads and re-validates the merge revision (must
+    still equal the draft's pinned base_revision), the open conflicts
+    (must still cover every drafted pointer) and the result_schema gate
+    (when the draft resolves the last conflict). On success every value
+    is applied at once, the revision bumps exactly once and the draft is
+    invalidated. Any changed condition yields 409 (a result_schema
+    violation 422) and neither the merge nor the draft is partially
+    written.
+    """
+    return store.commit_draft(merge_id, draft_id)

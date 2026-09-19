@@ -45,6 +45,11 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 | `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值（最后一批须通过 schema 门禁） |
 | `POST` | `/merges/{merge_id}/resolution-preview` | 预演冲突解决：内存副本上校验并应用，不落库、不改状态 |
 | `POST` | `/merges/{merge_id}/rule-resolutions` | 携带 revision 与有序路径规则，按模式批量裁决冲突（最后一批须通过门禁） |
+| `POST` | `/merges/{merge_id}/drafts` | 为待处理合并单创建解决草案（固定创建时的 revision） |
+| `GET` | `/merges/{merge_id}/drafts/{draft_id}` | 查看草案：状态、钉住的 base_revision、已累积的取值 |
+| `POST` | `/merges/{merge_id}/drafts/{draft_id}/resolutions` | 向草案追加或覆盖冲突取值（只改草案，不改合并单） |
+| `GET` | `/merges/{merge_id}/drafts/{draft_id}/preview` | 草案预演：应用草案后的文档与剩余冲突，不落库 |
+| `POST` | `/merges/{merge_id}/drafts/{draft_id}/commit` | 单事务提交草案：重校验后一次性应用全部取值并使草案失效 |
 | `GET` | `/merges/{merge_id}/patch` | resolved 后：base → result 的 RFC 6902 补丁（含 SHA-256） |
 | `GET` | `/health` | 健康检查 |
 
@@ -279,7 +284,51 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/ru
 - **一条都没命中**时不写入、不递增 revision（响应中 `applied: false`）；这不算错误，返回 `200`。
 - **revision 过期 → `409`**（响应体携带 `current_revision`）；合并单已 `resolved` 后同样 `409`；合并单不存在 → `404`。
 
-### 6. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
+### 6. 持久化解决草案 — `/merges/{merge_id}/drafts`
+
+逐条提交 `resolutions` 要求每批都携带最新 revision，适合在线一次性解决。若取值需要跨请求逐步收集（多人协作、审批流、离线试算），可以为 `pending` 合并单创建**解决草案**：草案**固定创建时的 merge revision**（`base_revision`），并快照当时的工作文档与开放冲突；之后的编辑只写草案，**不改合并单**。
+
+**生命周期**：`open`（可编辑、可预演、可提交）→ 提交成功后 `committed`（**失效**，再编辑/预演/提交一律 `409`，草案内容仍可 `GET` 查看）。
+
+```bash
+# 1) 创建草案（201）：返回 draft_id、base_revision、空 resolutions
+curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/drafts
+
+# 2) 追加或覆盖取值（可分多批补齐；同一指针重复给出即覆盖，语义同 resolutions）
+curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/drafts/9f1e…/resolutions \
+  -H 'Content-Type: application/json' \
+  -d '{"resolutions": [{"pointer": "/db/host", "choice": "left"}]}'
+
+# 3) 预演：基于创建时快照应用草案，返回剩余冲突；补全时附 patch 与 result_sha256
+curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/drafts/9f1e…/preview
+
+# 4) 提交：单事务内重校验后一次性应用全部取值，草案随即失效
+curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/drafts/9f1e…/commit
+```
+
+预演响应（草案只覆盖了部分指针时，`remaining_conflicts` 列出其余开放冲突）：
+
+```json
+{
+  "merge_id": "bc6d2c3d9a3343bf9177147a10ec4023",
+  "draft_id": "9f1e…",
+  "base_revision": 1,
+  "current_revision": 1,
+  "document": {"replicas": 3, "db": {"host": "b", "port": 5433}},
+  "remaining_conflicts": [],
+  "would_resolve": true,
+  "patch": ["…"],
+  "result_sha256": "5f4a…"
+}
+```
+
+- **编辑语义复用 resolutions**：每条取值二选一 `choice` / `value`（显式 `null` 算给出 `value`；两者同给或都不给 → `400`）；未知冲突指针 → `400`（`no open conflict at pointer …`）。编辑只更新草案行，合并单的 `revision`、`conflicts`、`document` 均不受影响。
+- **预演无副作用**：基于草案创建时的快照计算，不写入、不改状态；`would_resolve` 为 `true` 时附确定性 `patch` 与 `result_sha256`（规则同 `resolution-preview`）。`current_revision` 与 `base_revision` 不一致时说明合并单已被其他请求推进，提交将返回 `409`。
+- **提交是原子操作**：在**单个事务**内重读合并单并重新校验——① 草案仍为 `open`；② 合并单仍 `pending`；③ 当前 `revision` 等于草案的 `base_revision`；④ 草案覆盖的每个指针仍是开放冲突；⑤ 若草案将解决最后一个冲突，候选结果须通过 `result_schema` 门禁。全部通过才**一次性应用全部取值**（`revision` 恰好 +1）并将草案置为 `committed`；任一条件变化 → **`409`**（revision 过期时响应体携带 `current_revision`；schema 不通过 → 复用 `422` 错误列表），**合并单与草案内容均不部分写入**（草案保持 `open`、取值原样保留，可修正后重试或放弃）。
+- **部分草案也可提交**：未覆盖的冲突原样保留，合并单继续 `pending`（与分批 resolutions 语义一致）；空草案（无任何取值）提交 → `400`。
+- 合并单已 `resolved` → 创建草案与提交草案均 `409`；合并单或草案不存在 → `404`（草案不能跨合并单 URL 访问）。
+
+### 7. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
 
 合并单 `resolved` 后，可获取从**原始 `base_doc` 到最终 `result`** 的确定性操作序列（[RFC 6902 JSON Patch](https://www.rfc-editor.org/rfc/rfc6902)，路径为 [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901)）：
 
@@ -329,7 +378,7 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/patch
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（87 项）
+python -m pytest tests/ -q                  # 运行测试（100 项）
 ```
 
 ## 项目结构
@@ -341,10 +390,10 @@ app/
   rules.py      # RFC 6901 风格路径模式（* 与 **）：规则编译、匹配、批量裁决
   patch.py      # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
   validation.py # Draft 2020-12 结果门禁：元 schema 校验 + 最终结果校验（422 错误排序）
-  store.py      # 合并单状态机：revision 校验、冲突解决、不可变结果、schema 门禁
-  db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移）
-  models.py     # Pydantic 请求模型（含可选 result_schema）
-tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁测试）
+  store.py      # 合并单状态机 + 解决草案：revision 校验、冲突解决、不可变结果、schema 门禁
+  db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移与单事务提交支持）
+  models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑请求）
+tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁与草案测试）
 Dockerfile
 docker-compose.yml
 requirements.txt

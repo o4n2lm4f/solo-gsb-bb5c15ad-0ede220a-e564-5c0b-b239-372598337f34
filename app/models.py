@@ -68,3 +68,14 @@ class RuleResolveRequest(BaseModel):
     rules: list[RuleItem] = Field(
         ..., min_length=1, description="Ordered resolution rules (first one wins ties)"
     )
+
+
+class DraftUpdateRequest(BaseModel):
+    resolutions: list[ResolutionItem] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Resolutions to append to (or overwrite in) the draft; each item "
+            "takes 'choice' or 'value', like a resolution batch"
+        ),
+    )
